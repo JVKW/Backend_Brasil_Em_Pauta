@@ -286,10 +286,14 @@ async function processDecision(gameCode, userUid, choiceIndex) {
         let endReason = null;
 
         // Derrota: Indicadores zerados ou Fome no máximo
-        if (updates.hunger >= 10 || Object.values(updates).some(v => v <= 0)) {
+            const nonHungerIndicators = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'];
+            const anyIndicatorAtOrBelowZero = nonHungerIndicators.some(key => updates[key] <= 0);
+
+        if (updates.hunger >= 10 || anyIndicatorAtOrBelowZero) {
             gameStatus = 'finished';
             endReason = 'collapsed';
         }
+        
         // Vitória: Chegar na casa 20
         if (updates.board_position >= 20) {
             gameStatus = 'finished';
