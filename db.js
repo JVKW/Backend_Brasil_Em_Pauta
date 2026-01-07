@@ -3,9 +3,12 @@ const { Pool } = require("pg");
 // Configuração do Pool de conexões (Singleton pattern implícito)
 const pool = new Pool({
     connectionString: process.env.CONNECTION_STRING,
-    max: 20, // Máximo de conexões simultâneas
+    max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 2000,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
 /**
