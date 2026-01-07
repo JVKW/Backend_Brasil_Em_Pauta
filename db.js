@@ -181,10 +181,20 @@ async function getFullGameState(gameCode) {
             WHERE sdc.session_id = $1 AND sdc.is_resolved = FALSE
         `, [session.id]);
 
+        //BUSCAR OS LOGS 
+        const logsRes = await client.query(`
+            SELECT id, turn, player_name as "playerName", player_role as "playerRole", decision_text as "decision", effects_text as "effects"
+            FROM game_logs 
+            WHERE session_id = $1 
+            ORDER BY id DESC
+        `, [session.id]);
+
+
         return {
             ...session,
             players: playersRes.rows,
-            currentCard: cardRes.rows[0] || null
+            currentCard: cardRes.rows[0] || null,
+            logs: logsRes.rows // <-- Adicione esta linha
         };
     } finally {
         client.release();
@@ -301,6 +311,15 @@ async function processDecision(gameCode, userUid, choiceIndex) {
                 updates[key] = Math.min(10, Math.max(0, updates[key] + val));
             }
         }
+
+        const effectsString = Object.entries(effects).map(([key, value]) => `${key}: ${value > 0 ? '+' : ''}${value}`).join(', ');
+
+        await client.query(`
+            INSERT INTO game_logs (session_id, turn, player_name, player_role, decision_text, effects_text)
+            SELECT $1, $2, p.nickname, p.character_role, $3, $4
+            FROM players p
+            WHERE p.id = $5
+        `, [state.id, state.current_turn, selectedOption.text, effectsString, state.player_id]);
 
         // 5. Verificar Vitória/Derrota
         let gameStatus = 'in_progress';
