@@ -16,6 +16,10 @@ function generateGameCode(length = 6) {
     return result;
 }
 
+// LISTA DE PAPÉIS VÁLIDOS (Deve bater com o CHECK do banco de dados)
+const AVAILABLE_ROLES = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jornalista'];
+
+
 /**
  * AÇÃO 2: Criar uma Nova Partida
  * Cria a sessão, o estado da nação e insere o primeiro jogador (Criador).
