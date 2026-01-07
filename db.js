@@ -315,17 +315,32 @@ async function processDecision(gameCode, userUid, choiceIndex) {
         });
 
         // 2. Aplicar a nova lógica de progressão
-        if (positiveConsequences === 0) {
-            if (totalConsequences >= 2) {
-                updates.board_position = Math.max(0, updates.board_position - 1); // Retrocede 1, sem ficar negativo
+        if (difficulty === 'hard') {
+            // Lógica para o modo Difícil: Baseado em Capital e Apoio Popular
+            const capitalChange = effects['capital'] || 0;
+            const supportChange = effects['popular_support'] || 0;
+
+            if (capitalChange > 0 && supportChange > 0) {
+                updates.board_position += 2; // Ganhou capital e apoio: grande avanço
+            } else if (capitalChange > 0 || supportChange > 0) {
+                updates.board_position += 1; // Ganhou um dos dois: avanço modesto
+            } else if (capitalChange < 0 && supportChange < 0) {
+                updates.board_position = Math.max(0, updates.board_position - 1); // Perdeu ambos: retrocede
             }
-            // Se tiver menos de 2 consequências negativas, não faz nada.
+            // Se não se encaixar em nenhuma regra, não avança nem retrocede.
         } else {
-            const ratio = positiveConsequences / totalConsequences;
-            if (ratio > 0.5) {
-                updates.board_position += 2; // Avança 2 casas
-            } else if (ratio >= 1/3) {
-                updates.board_position += 1; // Avança 1 casa
+            if (positiveConsequences === 0) {
+                if (totalConsequences >= 2) {
+                    updates.board_position = Math.max(0, updates.board_position - 1); // Retrocede 1, sem ficar negativo
+                }
+                // Se tiver menos de 2 consequências negativas, não faz nada.
+            } else {
+                const ratio = positiveConsequences / totalConsequences;
+                if (ratio > 0.5) {
+                    updates.board_position += 2; // Avança 2 casas
+                } else if (ratio >= 1/3) {
+                    updates.board_position += 1; // Avança 1 casa
+                }
             }
         }
 
