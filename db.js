@@ -253,7 +253,7 @@ async function restartGame(gameCode, userUid) {
     }
 }
 
-async function processDecision(gameCode, userUid, choiceIndex) {
+async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
     // choiceIndex deve ser um inteiro: 0, 1, 2 ou 3
     const client = await pool.connect();
     
