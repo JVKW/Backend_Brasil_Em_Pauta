@@ -26,7 +26,6 @@ async function createGame(userUid, playerName) {
         await client.query('BEGIN');
 
         let gameCode = generateGameCode();
-        // Lógica simples de colisão
         let codeExists = true;
         while(codeExists) {
             const res = await client.query('SELECT 1 FROM game_sessions WHERE game_code = $1', [gameCode]);
@@ -34,19 +33,23 @@ async function createGame(userUid, playerName) {
             else gameCode = generateGameCode();
         }
 
-        // Cria sessão já com valores padrão (Waiting)
+        // Cria sessão
         const sessionRes = await client.query(`
             INSERT INTO game_sessions (game_code, status, current_turn, current_player_index, creator_user_uid)
-            VALUES ($1, 'waiting', 1, 0, $2) -- Passando o userUid aqui
+            VALUES ($1, 'waiting', 1, 0, $2)
             RETURNING id
         `, [gameCode, userUid]);
         const sessionId = sessionRes.rows[0].id;
 
-        // Insere Criador
+        // --- MUDANÇA AQUI ---
+        // Sorteia um papel aleatório para o criador
+        const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
+
+        // Insere Criador com o papel sorteado
         await client.query(`
             INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
-            VALUES ($1, $2, $3, 10, 'Presidente', 0)
-        `, [sessionId, playerName, userUid]);
+            VALUES ($1, $2, $3, 10, $4, 0)
+        `, [sessionId, playerName, userUid, randomRole]);
 
         await client.query('COMMIT');
         return { success: true, gameCode, sessionId };
