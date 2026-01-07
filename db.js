@@ -300,11 +300,39 @@ async function restartGame(gameCode, userUid) {
         client.release();
     }
 }
+/**
+ * Muda o status de 'waiting' para 'in_progress'
+ */
+async function startGame(gameCode) {
+    const client = await pool.connect();
+    try {
+        // Atualiza apenas se o status atual for 'waiting'
+        const result = await client.query(`
+            UPDATE game_sessions 
+            SET status = 'in_progress' 
+            WHERE game_code = $1 AND status = 'waiting'
+        `, [gameCode]);
+
+        if (result.rowCount === 0) {
+            // Se não atualizou nada, ou o código está errado ou o jogo já começou
+            throw new Error("Não foi possível iniciar a partida. Verifique se o código está correto ou se o jogo já começou.");
+        }
+
+        return { success: true };
+
+    } catch (e) {
+        console.error("Erro ao iniciar jogo:", e);
+        throw e;
+    } finally {
+        client.release();
+    }
+}
 
 module.exports = {
     createGame,
     joinGame,
     getFullGameState,
     applyTurnDecision,
-    restartGame
+    restartGame,
+    startGame 
 };

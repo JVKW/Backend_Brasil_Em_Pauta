@@ -194,3 +194,38 @@ app.get("/boss/:id", async (req, res) => {
 app.listen(port, () => {
     console.log(`Servidor rodando na porta ${port}`);
 });
+
+
+// =======================================================
+// ROTA 6: INICIAR PARTIDA (Mudar status para in_progress)
+// =======================================================
+app.post("/game/start", async (req, res) => {
+    try {
+        /* #swagger.parameters['body'] = {
+            in: 'body',
+            description: 'Inicia a partida mudando status para in_progress',
+            schema: {
+                gameCode: 'ABC123'
+            }
+        } */
+
+        const { gameCode } = req.body;
+
+        if (!gameCode) {
+            return res.status(400).json({ error: "O código da partida é obrigatório." });
+        }
+
+        await db.startGame(gameCode);
+        
+        res.json({ 
+            success: true, 
+            message: "Partida iniciada com sucesso! Status alterado para in_progress." 
+        });
+
+    } catch (error) {
+        console.error(error);
+        // Retorna 400 se for erro de lógica (jogo não encontrado/já iniciado) ou 500 se for erro de banco
+        const status = error.message.includes("Não foi possível") ? 404 : 500;
+        res.status(status).json({ error: error.message });
+    }
+});
