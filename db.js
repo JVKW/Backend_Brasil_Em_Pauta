@@ -115,9 +115,23 @@ async function startGame(gameCode) {
         if (sessionRes.rowCount === 0) throw new Error("Não encontrado");
         const sessionId = sessionRes.rows[0].id;
 
-        // Sorteia carta
-        const cardRes = await client.query(`SELECT id FROM decision_cards ORDER BY RANDOM() LIMIT 1`);
-        if (cardRes.rowCount === 0) throw new Error("Banco de cartas vazio!");
+        // 1. Descobrir quem é o primeiro jogador (turn_order = 0)
+        const playerRes = await client.query(`
+            SELECT character_role FROM players 
+            WHERE session_id = $1 AND turn_order = 0
+        `, [sessionId]);
+
+        if (playerRes.rowCount === 0) throw new Error("Sem jogadores na partida.");
+        const firstPlayerRole = playerRes.rows[0].character_role;
+
+        // 2. Sortear carta ESPECÍFICA para esse papel
+        const cardRes = await client.query(`
+            SELECT id FROM decision_cards 
+            WHERE assigned_role = $1 
+            ORDER BY RANDOM() LIMIT 1
+        `, [firstPlayerRole]);
+
+        if (cardRes.rowCount === 0) throw new Error(`Sem cartas disponíveis para o papel: ${firstPlayerRole}`);
         
         await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [sessionId, cardRes.rows[0].id]);
         
@@ -293,7 +307,7 @@ async function processDecision(gameCode, userUid, choiceIndex) {
             gameStatus = 'finished';
             endReason = 'collapsed';
         }
-        
+
         // Vitória: Chegar na casa 20
         if (updates.board_position >= 20) {
             gameStatus = 'finished';
@@ -333,8 +347,28 @@ async function processDecision(gameCode, userUid, choiceIndex) {
             }
             await client.query(`UPDATE game_sessions SET current_player_index = $1 WHERE id = $2`, [nextIndex, state.id]);
 
-            // Nova Carta
-            const newCardRes = await client.query(`SELECT id FROM decision_cards ORDER BY RANDOM() LIMIT 1`);
+            // === MUDANÇA AQUI: SORTEIO DIRECIONADO ===
+            
+            // 1. Descobrir o papel do PRÓXIMO jogador
+            const nextPlayerRes = await client.query(`
+                SELECT character_role FROM players 
+                WHERE session_id = $1 AND turn_order = $2
+            `, [state.id, nextIndex]);
+            
+            const nextRole = nextPlayerRes.rows[0].character_role;
+
+            // 2. Buscar carta para esse papel
+            const newCardRes = await client.query(`
+                SELECT id FROM decision_cards 
+                WHERE assigned_role = $1 
+                ORDER BY RANDOM() LIMIT 1
+            `, [nextRole]);
+
+            // (Opcional: Se não tiver carta para o papel, buscar uma genérica ou dar erro)
+            if (newCardRes.rowCount === 0) {
+                throw new Error(`O deck do papel ${nextRole} acabou!`);
+            }
+
             await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [state.id, newCardRes.rows[0].id]);
         }
 
