@@ -83,80 +83,27 @@ app.get("/game/:gameCode", async (req, res) => {
 app.post("/game/decision", async (req, res) => {
     try {
         const { gameCode, userUid, choice } = req.body; 
-        // choice deve ser 'ethical' ou 'corrupt'
-
-        if (!['ethical', 'corrupt'].includes(choice)) {
-            return res.status(400).json({ error: "Escolha inválida." });
-        }
-
-        // 1. Busca estado atual para validar regras
-        const gameState = await db.getFullGameState(gameCode);
-        if (!gameState) return res.status(404).json({ error: "Jogo não encontrado." });
-
-        // 2. Validação: É a vez desse usuário?
-        const currentPlayer = gameState.players[gameState.current_player_index];
         
-        // Se não houver jogador (erro de indice) ou UID não bater
-        if (!currentPlayer || currentPlayer.user_uid !== userUid) {
-            return res.status(403).json({ error: "Não é sua vez de jogar." });
+        // Validação: Aceita apenas números inteiros (0 a 3)
+        // O backend (db.js) fará a validação final se o índice existe no array da carta
+        if (typeof choice !== 'number') {
+             return res.status(400).json({ error: "A escolha deve ser o índice da opção (número)." });
         }
 
-        if (!gameState.currentCard) {
-            return res.status(400).json({ error: "Não há carta ativa para resolver." });
-        }
-
-        // 3. Calcular Efeitos (Regra de Negócio)
-        // Pega os efeitos do JSON salvo no banco
-        const effects = choice === 'ethical' 
-            ? gameState.currentCard.ethical_choice_effect 
-            : gameState.currentCard.corrupt_choice_effect;
-
-        // Função auxiliar para garantir limites 0 a 10
-        const clamp = (val) => Math.min(10, Math.max(0, val));
-
-        const newStats = {
-            economy: clamp(gameState.economy + (effects.economy || 0)),
-            education: clamp(gameState.education + (effects.education || 0)),
-            wellbeing: clamp(gameState.wellbeing + (effects.wellbeing || 0)),
-            popular_support: clamp(gameState.popular_support + (effects.popular_support || 0)),
-            hunger: clamp(gameState.hunger + (effects.hunger || 0)),
-            military_religion: clamp(gameState.military_religion + (effects.military_religion || 0)),
-            board_position: gameState.board_position // Posição pode mudar se tiver dado, etc.
-        };
-
-        // Capital muda? (Ex: Corrupção ganha dinheiro, Ética perde ou mantém)
-        const capitalChange = effects.capital || 0;
-
-        // 4. Calcular Próximo Turno
-        const totalPlayers = gameState.players.length;
-        let nextPlayerIndex = gameState.current_player_index + 1;
-        let incrementTurn = false;
-
-        if (nextPlayerIndex >= totalPlayers) {
-            nextPlayerIndex = 0;
-            incrementTurn = true; // Completou uma rodada na mesa
-        }
-
-        // 5. Aplicar no Banco
-        const updateData = {
-            playerId: currentPlayer.id,
-            newStats: newStats,
-            capitalChange: capitalChange,
-            sessionCardId: gameState.currentCard.session_card_id,
-            nextPlayerIndex: nextPlayerIndex,
-            incrementTurn: incrementTurn
-        };
-
-        await db.applyTurnDecision(gameCode, updateData);
-
+        const result = await db.processDecision(gameCode.toUpperCase(), userUid, choice);
+        
         res.json({ 
             success: true, 
             message: "Decisão aplicada.",
-            effectsApplied: effects
+            gameState: result // Retorna o novo estado (stats, nextCard, status)
         });
 
     } catch (error) {
         console.error("Erro na decisão:", error);
+        // Tratamento de erros específicos de regra de negócio
+        if (error.message.includes("Não é o seu turno") || error.message.includes("Jogo não está ativo")) {
+            return res.status(403).json({ error: error.message });
+        }
         res.status(500).json({ error: "Erro ao processar jogada." });
     }
 });

@@ -1,25 +1,18 @@
 const { Pool } = require("pg");
 
-// Configuração do Pool de conexões (Singleton pattern implícito)
 const pool = new Pool({
     connectionString: process.env.CONNECTION_STRING,
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 2000,
-    ssl: {
-        rejectUnauthorized: false
-    }
+    ssl: { rejectUnauthorized: false }
 });
 
-/**
- * Função utilitária para gerar código de sala (ex: XJ3K9M)
- */
+// Helper
 function generateGameCode(length = 6) {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let result = '';
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
+    for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
     return result;
 }
 
@@ -29,13 +22,11 @@ function generateGameCode(length = 6) {
  */
 async function createGame(userUid, playerName) {
     const client = await pool.connect();
-    
     try {
-        await client.query('BEGIN'); // Inicia Transação
+        await client.query('BEGIN');
 
-        // 1. Gerar código único e criar Sessão
         let gameCode = generateGameCode();
-        // Loop simples para garantir unicidade (embora colisão seja rara)
+        // Lógica simples de colisão
         let codeExists = true;
         while(codeExists) {
             const res = await client.query('SELECT 1 FROM game_sessions WHERE game_code = $1', [gameCode]);
@@ -43,32 +34,24 @@ async function createGame(userUid, playerName) {
             else gameCode = generateGameCode();
         }
 
+        // Cria sessão já com valores padrão (Waiting)
         const sessionRes = await client.query(`
-            INSERT INTO game_sessions (game_code, status, creator_user_uid, current_turn, current_player_index)
-            VALUES ($1, 'waiting', $2, 1, 0)
-            RETURNING id, game_code
+            INSERT INTO game_sessions (game_code, status, current_turn, current_player_index, creator_user_uid)
+            VALUES ($1, 'waiting', 1, 0, $2) -- Passando o userUid aqui
+            RETURNING id
         `, [gameCode, userUid]);
-
         const sessionId = sessionRes.rows[0].id;
 
-        // 2. Criar Estado da Nação Inicial (Valores padrão definidos no SQL)
+        // Insere Criador
         await client.query(`
-            INSERT INTO nation_states (game_session_id)
-            VALUES ($1)
-        `, [sessionId]);
-
-        // 3. Inserir o Jogador Criador
-        await client.query(`
-            INSERT INTO players (game_session_id, name, user_uid, character_role, capital)
-            VALUES ($1, $2, $3, 'Presidente', 50) -- Exemplo de role inicial
+            INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
+            VALUES ($1, $2, $3, 10, 'Presidente', 0)
         `, [sessionId, playerName, userUid]);
 
-        await client.query('COMMIT'); // Salva tudo
+        await client.query('COMMIT');
         return { success: true, gameCode, sessionId };
-
     } catch (e) {
-        await client.query('ROLLBACK'); // Desfaz se der erro
-        console.error("Erro ao criar jogo:", e);
+        await client.query('ROLLBACK');
         throw e;
     } finally {
         client.release();
@@ -77,46 +60,71 @@ async function createGame(userUid, playerName) {
 
 /**
  * AÇÃO 3: Entrar em uma Partida Existente
- * Verifica status, lotação e se o usuário já está nela.
+ * Verifica status, lotação e atribui um papel único ao jogador.
  */
 async function joinGame(gameCode, userUid, playerName) {
     const client = await pool.connect();
-    
     try {
         await client.query('BEGIN');
-
-        // 1. Buscar Sessão
-        const sessionRes = await client.query(`
-            SELECT id, status FROM game_sessions WHERE game_code = $1 FOR UPDATE
-        `, [gameCode]); // 'FOR UPDATE' trava a linha para evitar condições de corrida
-
+        
+        const sessionRes = await client.query(`SELECT id, status FROM game_sessions WHERE game_code = $1 FOR UPDATE`, [gameCode]);
         if (sessionRes.rowCount === 0) throw new Error("Partida não encontrada.");
         const session = sessionRes.rows[0];
 
-        if (session.status !== 'waiting') throw new Error("A partida já começou ou terminou.");
-
-        // 2. Verificar Jogadores Atuais
-        const playersRes = await client.query(`
-            SELECT user_uid FROM players WHERE game_session_id = $1
-        `, [session.id]);
-
-        if (playersRes.rows.length >= 4) throw new Error("A sala está cheia.");
-        
-        const alreadyJoined = playersRes.rows.some(p => p.user_uid === userUid);
-        if (alreadyJoined) {
-             await client.query('ROLLBACK');
-             return { success: true, message: "Reconectado à sala." }; // Apenas retorna sucesso se já estiver lá
+        // Se já estiver na sala, retorna sucesso (reconnect)
+        const checkPlayer = await client.query('SELECT 1 FROM players WHERE session_id = $1 AND user_uid = $2', [session.id, userUid]);
+        if (checkPlayer.rowCount > 0) {
+            await client.query('ROLLBACK');
+            return { success: true, message: "Reconectado." };
         }
 
-        // 3. Inserir Novo Jogador
+        if (session.status !== 'waiting') throw new Error("Partida já iniciada.");
+
+        // Lógica de Papéis
+        const playersRes = await client.query(`SELECT character_role FROM players WHERE session_id = $1`, [session.id]);
+        if (playersRes.rowCount >= 4) throw new Error("Sala cheia.");
+
+        const roles = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jornalista'];
+        const usedRoles = playersRes.rows.map(p => p.character_role);
+        const available = roles.filter(r => !usedRoles.includes(r));
+        const assignedRole = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : 'Cidadão';
+
+        // Insere Jogador
         await client.query(`
-            INSERT INTO players (game_session_id, name, user_uid, capital)
-            VALUES ($1, $2, $3, 10)
-        `, [session.id, playerName, userUid]);
+            INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
+            VALUES ($1, $2, $3, 10, $4, $5)
+        `, [session.id, playerName, userUid, assignedRole, playersRes.rowCount]); // turn_order = num atual de players
 
         await client.query('COMMIT');
-        return { success: true, sessionId: session.id };
+        return { success: true };
+    } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+    } finally {
+        client.release();
+    }
+}
 
+
+async function startGame(gameCode) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const sessionRes = await client.query(`SELECT id, status FROM game_sessions WHERE game_code = $1`, [gameCode]);
+        if (sessionRes.rowCount === 0) throw new Error("Não encontrado");
+        const sessionId = sessionRes.rows[0].id;
+
+        // Sorteia carta
+        const cardRes = await client.query(`SELECT id FROM decision_cards ORDER BY RANDOM() LIMIT 1`);
+        if (cardRes.rowCount === 0) throw new Error("Banco de cartas vazio!");
+        
+        await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [sessionId, cardRes.rows[0].id]);
+        
+        // Atualiza status
+        await client.query(`UPDATE game_sessions SET status = 'in_progress' WHERE id = $1`, [sessionId]);
+
+        await client.query('COMMIT');
     } catch (e) {
         await client.query('ROLLBACK');
         throw e;
@@ -133,122 +141,35 @@ async function joinGame(gameCode, userUid, playerName) {
 async function getFullGameState(gameCode) {
     const client = await pool.connect();
     try {
-        // Busca Session + Nation State
-        const sessionQuery = `
-            SELECT 
-                gs.id as session_id, gs.game_code, gs.status, gs.current_turn, gs.current_player_index, gs.creator_user_uid,
-                ns.economy, ns.education, ns.wellbeing, ns.popular_support, ns.hunger, ns.military_religion, ns.board_position
-            FROM game_sessions gs
-            JOIN nation_states ns ON ns.game_session_id = gs.id
-            WHERE gs.game_code = $1
-        `;
-        
-        const sessionRes = await client.query(sessionQuery, [gameCode]);
+        const sessionRes = await client.query(`
+            SELECT * FROM game_sessions WHERE game_code = $1
+        `, [gameCode]);
         if (sessionRes.rowCount === 0) return null;
+        const session = sessionRes.rows[0];
 
-        const sessionData = sessionRes.rows[0];
-
-        // Busca Jogadores
         const playersRes = await client.query(`
-            SELECT id, name, character_role, capital, user_uid 
-            FROM players 
-            WHERE game_session_id = $1
-            ORDER BY id ASC -- Importante manter a ordem para o índice do turno
-        `, [sessionData.session_id]);
+            SELECT id, nickname, character_role, capital, user_uid, turn_order
+            FROM players WHERE session_id = $1 ORDER BY turn_order ASC
+        `, [session.id]);
 
-        // Busca Carta Atual (A primeira não resolvida ordenado por ordem)
-        // Se usar sorteio dinâmico, essa lógica pode mudar.
+        // Busca carta atual E AS OPÇÕES
         const cardRes = await client.query(`
-            SELECT dc.title, dc.dilemma, dc.ethical_choice_effect, dc.corrupt_choice_effect, sdc.id as session_card_id
+            SELECT sdc.id as session_card_id, dc.title, dc.dilemma, dc.options
             FROM session_decision_cards sdc
-            JOIN decision_cards dc ON dc.id = sdc.decision_card_id
-            WHERE sdc.game_session_id = $1 AND sdc.is_resolved = FALSE
-            ORDER BY sdc.order_num ASC
-            LIMIT 1
-        `, [sessionData.session_id]);
+            JOIN decision_cards dc ON sdc.card_id = dc.id
+            WHERE sdc.session_id = $1 AND sdc.is_resolved = FALSE
+        `, [session.id]);
 
         return {
-            ...sessionData,
+            ...session,
             players: playersRes.rows,
             currentCard: cardRes.rows[0] || null
         };
-
     } finally {
         client.release();
     }
 }
 
-/**
- * AÇÃO 4: Aplicar Decisão (Turno)
- * Recebe o objeto de mudanças calculadas pelo backend (Express) e aplica atomicamente.
- */
-async function applyTurnDecision(gameCode, updateData) {
-    // updateData espera:
-    // {
-    //   playerId: UUID,
-    //   newStats: { economy: 5, ... },
-    //   capitalChange: -10,
-    //   sessionCardId: UUID (carta resolvida),
-    //   nextPlayerIndex: 1,
-    //   incrementTurn: boolean
-    // }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        // 1. Pegar ID da Sessão
-        const sessionRes = await client.query('SELECT id FROM game_sessions WHERE game_code = $1', [gameCode]);
-        const sessionId = sessionRes.rows[0].id;
-
-        // 2. Atualizar Nação
-        const s = updateData.newStats;
-        if (s) {
-            await client.query(`
-                UPDATE nation_states 
-                SET economy = $1, education = $2, wellbeing = $3, popular_support = $4, 
-                    hunger = $5, military_religion = $6, board_position = $7
-                WHERE game_session_id = $8
-            `, [s.economy, s.education, s.wellbeing, s.popular_support, s.hunger, s.military_religion, s.board_position, sessionId]);
-        }
-
-        // 3. Atualizar Capital do Jogador
-        if (updateData.capitalChange !== 0) {
-            await client.query(`
-                UPDATE players SET capital = capital + $1 WHERE id = $2
-            `, [updateData.capitalChange, updateData.playerId]);
-        }
-
-        // 4. Marcar carta como resolvida
-        if (updateData.sessionCardId) {
-            await client.query(`
-                UPDATE session_decision_cards SET is_resolved = TRUE WHERE id = $1
-            `, [updateData.sessionCardId]);
-        }
-
-        // 5. Passar Turno
-        let turnSql = `UPDATE game_sessions SET current_player_index = $1`;
-        const params = [updateData.nextPlayerIndex];
-        
-        if (updateData.incrementTurn) {
-            turnSql += `, current_turn = current_turn + 1`;
-        }
-        turnSql += ` WHERE id = $2`;
-        params.push(sessionId);
-
-        await client.query(turnSql, params);
-
-        await client.query('COMMIT');
-        return { success: true };
-
-    } catch (e) {
-        await client.query('ROLLBACK');
-        console.error(e);
-        throw e;
-    } finally {
-        client.release();
-    }
-}
 
 /**
  * AÇÃO 5: Reiniciar Partida
@@ -300,39 +221,137 @@ async function restartGame(gameCode, userUid) {
         client.release();
     }
 }
-/**
- * Muda o status de 'waiting' para 'in_progress'
- */
-async function startGame(gameCode) {
-    const client = await pool.connect();
-    try {
-        // Atualiza apenas se o status atual for 'waiting'
-        const result = await client.query(`
-            UPDATE game_sessions 
-            SET status = 'in_progress' 
-            WHERE game_code = $1 AND status = 'waiting'
-        `, [gameCode]);
 
-        if (result.rowCount === 0) {
-            // Se não atualizou nada, ou o código está errado ou o jogo já começou
-            throw new Error("Não foi possível iniciar a partida. Verifique se o código está correto ou se o jogo já começou.");
+async function processDecision(gameCode, userUid, choiceIndex) {
+    // choiceIndex deve ser um inteiro: 0, 1, 2 ou 3
+    const client = await pool.connect();
+    
+    try {
+        await client.query('BEGIN');
+
+        // 1. Validar Sessão e Turno
+        const sessionRes = await client.query(`
+            SELECT s.*, p.user_uid as current_player_uid, p.id as player_id, p.capital 
+            FROM game_sessions s
+            JOIN players p ON s.id = p.session_id AND p.turn_order = s.current_player_index
+            WHERE s.game_code = $1
+        `, [gameCode]);
+        
+        const state = sessionRes.rows[0];
+        if (!state) throw new Error("Sessão inválida");
+        if (state.status !== 'in_progress') throw new Error("Jogo não está ativo");
+        if (state.current_player_uid !== userUid) throw new Error("Não é o seu turno!");
+
+        // 2. Buscar Carta e Opções
+        const cardRes = await client.query(`
+            SELECT sdc.id as session_card_id, dc.options
+            FROM session_decision_cards sdc
+            JOIN decision_cards dc ON sdc.card_id = dc.id
+            WHERE sdc.session_id = $1 AND sdc.is_resolved = FALSE
+        `, [state.id]);
+        
+        const currentCard = cardRes.rows[0];
+        if (!currentCard) throw new Error("Nenhuma carta ativa.");
+
+        // 3. Validar Escolha
+        const idx = parseInt(choiceIndex);
+        if (isNaN(idx) || idx < 0 || idx >= currentCard.options.length) {
+            throw new Error("Opção inválida.");
         }
 
-        return { success: true };
+        const selectedOption = currentCard.options[idx];
+        const effects = selectedOption.effect; // JSON com os efeitos
+
+        // 4. Aplicar Efeitos
+        let updates = {
+            economy: state.economy, education: state.education, wellbeing: state.wellbeing,
+            popular_support: state.popular_support, hunger: state.hunger, military_religion: state.military_religion,
+            board_position: state.board_position
+        };
+        let newPlayerCapital = state.capital;
+
+        // Loop de aplicação com Clamping
+        for (const [key, val] of Object.entries(effects)) {
+            if (key === 'capital') {
+                newPlayerCapital = Math.max(0, newPlayerCapital + val);
+            } else if (key === 'board_position') {
+                updates.board_position += val;
+            } else if (updates.hasOwnProperty(key)) {
+                updates[key] = Math.min(10, Math.max(0, updates[key] + val));
+            }
+        }
+
+        // 5. Verificar Vitória/Derrota
+        let gameStatus = 'in_progress';
+        let endReason = null;
+
+        // Derrota: Indicadores zerados ou Fome no máximo
+        if (updates.hunger >= 10 || Object.values(updates).some(v => v <= 0)) {
+            gameStatus = 'finished';
+            endReason = 'collapsed';
+        }
+        // Vitória: Chegar na casa 20
+        if (updates.board_position >= 20) {
+            gameStatus = 'finished';
+            endReason = 'victory';
+        }
+
+        // 6. Atualizações no Banco
+        await client.query(`
+            UPDATE game_sessions SET 
+                economy=$1, education=$2, wellbeing=$3, popular_support=$4, 
+                hunger=$5, military_religion=$6, board_position=$7, 
+                status=$8, end_reason=$9 
+            WHERE id=$10
+        `, [
+            updates.economy, updates.education, updates.wellbeing, updates.popular_support, 
+            updates.hunger, updates.military_religion, updates.board_position, 
+            gameStatus, endReason, state.id
+        ]);
+
+        await client.query(`UPDATE players SET capital = $1 WHERE id = $2`, [newPlayerCapital, state.player_id]);
+
+        // Marcar carta resolvida (salva o índice escolhido)
+        await client.query(`
+            UPDATE session_decision_cards SET is_resolved = TRUE, choice_made = $1 WHERE id = $2
+        `, [idx, currentCard.session_card_id]);
+
+        // 7. Próximo Turno
+        if (gameStatus === 'in_progress') {
+            const countRes = await client.query(`SELECT COUNT(*) as c FROM players WHERE session_id = $1`, [state.id]);
+            const totalPlayers = parseInt(countRes.rows[0].c);
+            
+            let nextIndex = (state.current_player_index + 1) % totalPlayers;
+            
+            // Rodada completou?
+            if (nextIndex === 0) {
+                await client.query(`UPDATE game_sessions SET current_turn = current_turn + 1 WHERE id = $1`, [state.id]);
+            }
+            await client.query(`UPDATE game_sessions SET current_player_index = $1 WHERE id = $2`, [nextIndex, state.id]);
+
+            // Nova Carta
+            const newCardRes = await client.query(`SELECT id FROM decision_cards ORDER BY RANDOM() LIMIT 1`);
+            await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [state.id, newCardRes.rows[0].id]);
+        }
+
+        await client.query('COMMIT');
+        return { status: gameStatus, newStats: updates, playerCapital: newPlayerCapital };
 
     } catch (e) {
-        console.error("Erro ao iniciar jogo:", e);
+        await client.query('ROLLBACK');
+        console.error(e);
         throw e;
     } finally {
         client.release();
     }
 }
 
+
 module.exports = {
     createGame,
     joinGame,
     getFullGameState,
-    applyTurnDecision,
     restartGame,
-    startGame 
+    startGame,
+    processDecision
 };
