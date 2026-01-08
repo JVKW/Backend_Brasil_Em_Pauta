@@ -24,7 +24,7 @@ const AVAILABLE_ROLES = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jorn
  * AÇÃO 2: Criar uma Nova Partida
  * Cria a sessão, o estado da nação e insere o primeiro jogador (Criador).
  */
-async function createGame(userUid, playerName) {
+async function createGame(userUid, playerName, isObserver = false) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -37,25 +37,30 @@ async function createGame(userUid, playerName) {
             else gameCode = generateGameCode();
         }
 
-        // Cria a sessão de jogo. creator_user_uid pode ser nulo se for um observador.
+        // Cria a sessão.
         const sessionRes = await client.query(`
             INSERT INTO game_sessions (game_code, status, current_turn, current_player_index, creator_user_uid)
             VALUES ($1, 'waiting', 1, 0, $2)
             RETURNING id
-        `, [gameCode, userUid]); // userUid pode ser null/undefined aqui
+        `, [gameCode, userUid]);
         const sessionId = sessionRes.rows[0].id;
 
-        // --- LÓGICA CONDICIONAL ---
-        // Só insere o jogador se um userUid e playerName forem fornecidos.
         if (userUid && playerName) {
-            // Sorteia um papel aleatório para o criador
-            const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
-
-            // Insere o Criador como o primeiro jogador
-            await client.query(`
-                INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
-                VALUES ($1, $2, $3, 10, $4, 0)
-            `, [sessionId, playerName, userUid, randomRole]);
+            if (isObserver) {
+                // --- CAMINHO DO OBSERVADOR ---
+                // Registra na tabela, mas sem capital, sem turno e role fixa
+                await client.query(`
+                    INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
+                    VALUES ($1, $2, $3, 0, 'observador', NULL)
+                `, [sessionId, playerName, userUid]);
+            } else {
+                // --- CAMINHO DO JOGADOR CRIADOR ---
+                const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
+                await client.query(`
+                    INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
+                    VALUES ($1, $2, $3, 10, $4, 0)
+                `, [sessionId, playerName, userUid, randomRole]);
+            }
         }
 
         await client.query('COMMIT');
@@ -81,7 +86,7 @@ async function joinGame(gameCode, userUid, playerName) {
         if (sessionRes.rowCount === 0) throw new Error("Partida não encontrada.");
         const session = sessionRes.rows[0];
 
-        // Se já estiver na sala, retorna sucesso (reconnect)
+        // Se já estiver na sala (seja player ou observador), reconecta
         const checkPlayer = await client.query('SELECT 1 FROM players WHERE session_id = $1 AND user_uid = $2', [session.id, userUid]);
         if (checkPlayer.rowCount > 0) {
             await client.query('ROLLBACK');
@@ -90,20 +95,28 @@ async function joinGame(gameCode, userUid, playerName) {
 
         if (session.status !== 'waiting') throw new Error("Partida já iniciada.");
 
-        // Lógica de Papéis
+        // Busca todos os jogadores atuais
         const playersRes = await client.query(`SELECT character_role FROM players WHERE session_id = $1`, [session.id]);
-        if (playersRes.rowCount >= 4) throw new Error("Sala cheia.");
+        
+        // Filtra apenas quem REALMENTE joga (ignora observador)
+        const activePlayers = playersRes.rows.filter(p => p.character_role !== 'observador');
+        
+        if (activePlayers.length >= 4) throw new Error("Sala cheia (máximo 4 jogadores).");
 
-        const roles = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jornalista'];
-        const usedRoles = playersRes.rows.map(p => p.character_role);
-        const available = roles.filter(r => !usedRoles.includes(r));
+        // Define papéis disponíveis (excluindo os já usados por jogadores ativos)
+        const usedRoles = activePlayers.map(p => p.character_role);
+        const available = AVAILABLE_ROLES.filter(r => !usedRoles.includes(r));
         const assignedRole = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : 'Cidadão';
+
+        // O turn_order deve ser igual ao número de jogadores ATIVOS atuais (0, 1, 2, 3)
+        // Se houver 1 observador e 0 jogadores, o próximo será turn_order 0.
+        const newTurnOrder = activePlayers.length;
 
         // Insere Jogador
         await client.query(`
             INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
             VALUES ($1, $2, $3, 10, $4, $5)
-        `, [session.id, playerName, userUid, assignedRole, playersRes.rowCount]); // turn_order = num atual de players
+        `, [session.id, playerName, userUid, assignedRole, newTurnOrder]);
 
         await client.query('COMMIT');
         return { success: true };
@@ -138,10 +151,13 @@ async function startGame(gameCode) {
         const cardRes = await client.query(`
             SELECT id FROM decision_cards 
             WHERE assigned_role = $1 
+            AND id NOT IN (
+                SELECT card_id FROM session_decision_cards WHERE session_id = $2
+            )
             ORDER BY RANDOM() LIMIT 1
-        `, [firstPlayerRole]);
+        `, [firstPlayerRole, sessionId]); 
 
-        if (cardRes.rowCount === 0) throw new Error(`Sem cartas disponíveis para o papel: ${firstPlayerRole}`);
+if (cardRes.rowCount === 0) throw new Error(`Sem cartas disponíveis (ou deck vazio) para o papel: ${firstPlayerRole}`);
         
         await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [sessionId, cardRes.rows[0].id]);
         
@@ -317,32 +333,29 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             }
         });
 
-        // 2. Aplicar a nova lógica de progressão
+        // Lógica de progressão (Dificuldade e Tabuleiro)
         if (difficulty === 'hard') {
-            // Lógica para o modo Difícil: Baseado em Capital e Apoio Popular
             const capitalChange = effects['capital'] || 0;
             const supportChange = effects['popular_support'] || 0;
 
             if (capitalChange > 0 && supportChange > 0) {
-                updates.board_position += 2; // Ganhou capital e apoio: grande avanço
+                updates.board_position += 2; 
             } else if (capitalChange > 0 || supportChange > 0) {
-                updates.board_position += 1; // Ganhou um dos dois: avanço modesto
+                updates.board_position += 1; 
             } else if (capitalChange < 0 && supportChange < 0) {
-                updates.board_position = Math.max(0, updates.board_position - 1); // Perdeu ambos: retrocede
+                updates.board_position = Math.max(0, updates.board_position - 1); 
             }
-            // Se não se encaixar em nenhuma regra, não avança nem retrocede.
         } else {
             if (positiveConsequences === 0) {
                 if (totalConsequences >= 2) {
-                    updates.board_position = Math.max(0, updates.board_position - 1); // Retrocede 1, sem ficar negativo
+                    updates.board_position = Math.max(0, updates.board_position - 1); 
                 }
-                // Se tiver menos de 2 consequências negativas, não faz nada.
             } else {
                 const ratio = positiveConsequences / totalConsequences;
                 if (ratio > 0.5) {
-                    updates.board_position += 2; // Avança 2 casas
+                    updates.board_position += 2; 
                 } else if (ratio >= 1/3) {
-                    updates.board_position += 1; // Avança 1 casa
+                    updates.board_position += 1; 
                 }
             }
         }
@@ -371,16 +384,14 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         let gameStatus = 'in_progress';
         let endReason = null;
 
-        // Derrota: Indicadores zerados ou Fome no máximo
-            const nonHungerIndicators = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'];
-            const anyIndicatorAtOrBelowZero = nonHungerIndicators.some(key => updates[key] <= 0);
+        const nonHungerIndicators = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'];
+        const anyIndicatorAtOrBelowZero = nonHungerIndicators.some(key => updates[key] <= 0);
 
         if (updates.hunger >= 10 || anyIndicatorAtOrBelowZero) {
             gameStatus = 'finished';
             endReason = 'collapsed';
         }
 
-        // Vitória: Chegar na casa 20
         if (updates.board_position >= 20) {
             gameStatus = 'finished';
             endReason = 'victory';
@@ -401,16 +412,22 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
 
         await client.query(`UPDATE players SET capital = $1 WHERE id = $2`, [newPlayerCapital, state.player_id]);
 
-        // Marcar carta resolvida (salva o índice escolhido)
         await client.query(`
             UPDATE session_decision_cards SET is_resolved = TRUE, choice_made = $1 WHERE id = $2
         `, [idx, currentCard.session_card_id]);
 
         // 7. Próximo Turno
         if (gameStatus === 'in_progress') {
-            const countRes = await client.query(`SELECT COUNT(*) as c FROM players WHERE session_id = $1`, [state.id]);
+            
+            // <--- MUDANÇA AQUI: Ignora o 'observador' na contagem total
+            const countRes = await client.query(`
+                SELECT COUNT(*) as c FROM players 
+                WHERE session_id = $1 AND character_role != 'observador'
+            `, [state.id]);
+            
             const totalPlayers = parseInt(countRes.rows[0].c);
             
+            // Calcula o próximo índice (0, 1, 2...)
             let nextIndex = (state.current_player_index + 1) % totalPlayers;
             
             // Rodada completou?
@@ -419,26 +436,41 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             }
             await client.query(`UPDATE game_sessions SET current_player_index = $1 WHERE id = $2`, [nextIndex, state.id]);
 
-            // === MUDANÇA AQUI: SORTEIO DIRECIONADO ===
             
-            // 1. Descobrir o papel do PRÓXIMO jogador
+            // 1. Descobrir o papel do PRÓXIMO jogador (O observador nunca será selecionado aqui pois turn_order dele é NULL)
             const nextPlayerRes = await client.query(`
                 SELECT character_role FROM players 
                 WHERE session_id = $1 AND turn_order = $2
             `, [state.id, nextIndex]);
             
+            // Segurança extra caso algo dê errado
+            if (nextPlayerRes.rowCount === 0) {
+                throw new Error("Erro crítico: Próximo jogador não encontrado.");
+            }
+
             const nextRole = nextPlayerRes.rows[0].character_role;
 
             // 2. Buscar carta para esse papel
-            const newCardRes = await client.query(`
+            let newCardRes = await client.query(`
                 SELECT id FROM decision_cards 
                 WHERE assigned_role = $1 
+                AND id NOT IN (
+                    SELECT card_id FROM session_decision_cards WHERE session_id = $2
+                )
                 ORDER BY RANDOM() LIMIT 1
-            `, [nextRole]);
+            `, [nextRole, state.id]);
 
-            // (Opcional: Se não tiver carta para o papel, buscar uma genérica ou dar erro)
             if (newCardRes.rowCount === 0) {
-                throw new Error(`O deck do papel ${nextRole} acabou!`);
+                await client.query(`DELETE FROM session_decision_cards WHERE session_id = $1 AND card_id IN (SELECT id FROM decision_cards WHERE assigned_role = $2)`, [state.id, nextRole]);
+
+                newCardRes = await client.query(`
+                SELECT id FROM decision_cards 
+                WHERE assigned_role = $1 
+                AND id NOT IN (
+                    SELECT card_id FROM session_decision_cards WHERE session_id = $2
+                )
+                ORDER BY RANDOM() LIMIT 1
+            `, [nextRole, state.id]);
             }
 
             await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [state.id, newCardRes.rows[0].id]);
