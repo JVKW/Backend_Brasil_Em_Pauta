@@ -37,23 +37,26 @@ async function createGame(userUid, playerName) {
             else gameCode = generateGameCode();
         }
 
-        // Cria sessão
+        // Cria a sessão de jogo. creator_user_uid pode ser nulo se for um observador.
         const sessionRes = await client.query(`
             INSERT INTO game_sessions (game_code, status, current_turn, current_player_index, creator_user_uid)
             VALUES ($1, 'waiting', 1, 0, $2)
             RETURNING id
-        `, [gameCode, userUid]);
+        `, [gameCode, userUid]); // userUid pode ser null/undefined aqui
         const sessionId = sessionRes.rows[0].id;
 
-        // --- MUDANÇA AQUI ---
-        // Sorteia um papel aleatório para o criador
-        const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
+        // --- LÓGICA CONDICIONAL ---
+        // Só insere o jogador se um userUid e playerName forem fornecidos.
+        if (userUid && playerName) {
+            // Sorteia um papel aleatório para o criador
+            const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
 
-        // Insere Criador com o papel sorteado
-        await client.query(`
-            INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
-            VALUES ($1, $2, $3, 10, $4, 0)
-        `, [sessionId, playerName, userUid, randomRole]);
+            // Insere o Criador como o primeiro jogador
+            await client.query(`
+                INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
+                VALUES ($1, $2, $3, 10, $4, 0)
+            `, [sessionId, playerName, userUid, randomRole]);
+        }
 
         await client.query('COMMIT');
         return { success: true, gameCode, sessionId };
