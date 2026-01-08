@@ -30,6 +30,7 @@ async function createGame(userUid, playerName, difficulty = 'easy', isObserver =
         await client.query('BEGIN');
 
         let gameCode = generateGameCode();
+        // ... (Lógica de verificar se código existe mantém igual) ...
         let codeExists = true;
         while(codeExists) {
             const res = await client.query('SELECT 1 FROM game_sessions WHERE game_code = $1', [gameCode]);
@@ -37,7 +38,7 @@ async function createGame(userUid, playerName, difficulty = 'easy', isObserver =
             else gameCode = generateGameCode();
         }
 
-        // Cria a sessão.
+        // 1. Cria a sessão (Sem os indicadores, apenas meta-dados)
         const sessionRes = await client.query(`
             INSERT INTO game_sessions (game_code, status, current_turn, current_player_index, creator_user_uid, difficulty)
             VALUES ($1, 'waiting', 1, 0, $2, $3)
@@ -45,26 +46,17 @@ async function createGame(userUid, playerName, difficulty = 'easy', isObserver =
         `, [gameCode, userUid, difficulty]);
         const sessionId = sessionRes.rows[0].id;
         
-        // Define os valores iniciais dos indicadores com base na dificuldade
-        const initialIndicatorValue = difficulty === 'hard' ? 3 : 5;
+        // 2. Cria o estado inicial usando a NOVA FUNÇÃO
+        await resetNationState(client, sessionId, difficulty);
 
-        // Cria o estado inicial da nação
-        await client.query(`
-            INSERT INTO nation_states (game_session_id, economy, education, wellbeing, popular_support, hunger, military_religion, board_position)
-            VALUES ($1, $2, $2, $2, $2, $2, $2, 0)
-        `, [sessionId, initialIndicatorValue]);
-
-
+        // 3. Cria o jogador (Mantém a lógica original)
         if (userUid && playerName) {
             if (isObserver) {
-                // --- CAMINHO DO OBSERVADOR ---
-                // Registra na tabela, mas sem capital, sem turno e role fixa
                 await client.query(`
                     INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
                     VALUES ($1, $2, $3, 0, 'Observador', NULL)
                 `, [sessionId, playerName, userUid]);
             } else {
-                // --- CAMINHO DO JOGADOR CRIADOR ---
                 const randomRole = AVAILABLE_ROLES[Math.floor(Math.random() * AVAILABLE_ROLES.length)];
                 await client.query(`
                     INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
@@ -82,6 +74,7 @@ async function createGame(userUid, playerName, difficulty = 'easy', isObserver =
         client.release();
     }
 }
+
 /**
  * AÇÃO 3: Entrar em uma Partida Existente
  * Verifica status, lotação e atribui um papel único ao jogador.
@@ -260,8 +253,9 @@ async function restartGame(gameCode, userUid) {
     try {
         await client.query('BEGIN');
 
-        // Verifica se é o dono
-        const sessionRes = await client.query(`SELECT id, creator_user_uid FROM game_sessions WHERE game_code = $1`, [gameCode]);
+        // Busca ID, Criador E DIFICULDADE
+        const sessionRes = await client.query(`SELECT id, creator_user_uid, difficulty FROM game_sessions WHERE game_code = $1`, [gameCode]);
+        if (sessionRes.rowCount === 0) throw new Error("Partida não encontrada");
         const session = sessionRes.rows[0];
         
         if (session.creator_user_uid !== userUid) {
@@ -271,25 +265,21 @@ async function restartGame(gameCode, userUid) {
         // 1. Resetar Sessão
         await client.query(`
             UPDATE game_sessions 
-            SET status = 'waiting', current_turn = 1, current_player_index = 0
+            SET status = 'waiting', current_turn = 1, current_player_index = 0, end_reason = NULL, game_over_message = NULL
             WHERE id = $1
         `, [session.id]);
 
-        // 2. Resetar Nação (Valores padrão 5)
-        await client.query(`
-            UPDATE nation_states
-            SET economy=5, education=5, wellbeing=5, popular_support=5, hunger=5, military_religion=5, board_position=0
-            WHERE game_session_id = $1
-        `, [session.id]);
+        // 2. Resetar Nação (Usando a nova função que respeita a dificuldade)
+        await resetNationState(client, session.id, session.difficulty);
 
-        // 3. Remover jogadores não-donos (Opcional: ou apenas resetar o capital de todos)
-        // Opção A: Resetar capital de todos e manter na sala
-        await client.query(`UPDATE players SET capital = 0 WHERE game_session_id = $1`, [session.id]);
+        // 3. Resetar Jogadores (Zera capital, mantém na sala)
+        await client.query(`UPDATE players SET capital = 0 WHERE session_id = $1`, [session.id]);
         
-        // 4. Resetar Cartas e Bosses
-        await client.query(`DELETE FROM session_decision_cards WHERE game_session_id = $1`, [session.id]);
-        await client.query(`DELETE FROM session_active_bosses WHERE game_session_id = $1`, [session.id]);
-        // Aqui você chamaria a função para sortear novas cartas (populateDeck)
+        // 4. Limpar Cartas e Logs
+        await client.query(`DELETE FROM session_decision_cards WHERE session_id = $1`, [session.id]);
+        await client.query(`DELETE FROM game_logs WHERE session_id = $1`, [session.id]); 
+        
+        // (Nota: session_active_bosses não estava no seu script SQL original, removi para evitar erro, adicione se existir)
 
         await client.query('COMMIT');
         return { success: true };
@@ -541,6 +531,31 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
     }
 }
 
+
+/**
+ * Helper: Reseta ou Inicializa o Estado da Nação
+ * Garante que a dificuldade (Hard/Easy) seja respeitada ao criar ou reiniciar.
+ */
+async function resetNationState(client, sessionId, difficulty) {
+    // Modo Difícil começa com 3, Normal/Fácil com 5
+    const initialValue = difficulty === 'hard' ? 3 : 5;
+
+    // Tenta atualizar se já existir
+    const updateRes = await client.query(`
+        UPDATE nation_states
+        SET economy=$1, education=$1, wellbeing=$1, popular_support=$1, 
+            hunger=0, military_religion=$1, board_position=0
+        WHERE game_session_id = $2
+    `, [initialValue, sessionId]);
+
+    // Se não atualizou nenhuma linha (é uma nova partida), insere.
+    if (updateRes.rowCount === 0) {
+        await client.query(`
+            INSERT INTO nation_states (game_session_id, economy, education, wellbeing, popular_support, hunger, military_religion, board_position)
+            VALUES ($1, $2, $2, $2, $2, 0, $2, 0)
+        `, [sessionId, initialValue]);
+    }
+}
 
 module.exports = {
     createGame,
