@@ -17,7 +17,7 @@ function generateGameCode(length = 6) {
 }
 
 // LISTA DE PAPÉIS VÁLIDOS (Deve bater com o CHECK do banco de dados)
-const AVAILABLE_ROLES = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jornalista'];
+const AVAILABLE_ROLES = ['Ministro', 'General', 'Opositor', 'Empresário', 'Jornalista', 'Oportunista'];
 
 
 /**
@@ -338,7 +338,7 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         const selectedOption = currentCard.options[idx];
         const effects = selectedOption.effect; // JSON com os efeitos
 
-        // 4. Aplicar Efeitos
+        // 4. Aplicar Efeitos e Calcular Progressão
         let updates = {
             economy: state.economy, education: state.education, wellbeing: state.wellbeing,
             popular_support: state.popular_support, hunger: state.hunger, military_religion: state.military_religion,
@@ -346,46 +346,64 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         };
         let newPlayerCapital = state.capital;
 
-        // Loop de aplicação com Clamping
+        // Loop de aplicação com Clamping (0 a 10)
         for (const [key, val] of Object.entries(effects)) {
             if (key === 'capital') {
                 newPlayerCapital = Math.max(0, newPlayerCapital + val);
             } else if (key === 'board_position') {
-                // Este efeito é tratado separadamente abaixo para consolidar lógica
+                // Tratado separadamente
             } else if (updates.hasOwnProperty(key)) {
                 updates[key] = Math.min(10, Math.max(0, updates[key] + val));
             }
         }
         
+        // --- LÓGICA DE PROGRESSÃO NO TABULEIRO ---
+        
+        // 1. Calcular proporção de consequências positivas
         const consequences = Object.entries(effects).filter(([key]) => key !== 'capital' && key !== 'board_position');
         const totalConsequences = consequences.length;
         let positiveConsequences = 0;
 
         consequences.forEach(([key, value]) => {
             if (key === 'hunger' && value < 0) {
-                positiveConsequences++;
+                positiveConsequences++; // Fome diminuir é bom
             } else if (key !== 'hunger' && value > 0) {
-                positiveConsequences++;
+                positiveConsequences++; // Outros aumentarem é bom
             }
         });
+
+        // Evita divisão por zero
+        const ratio = totalConsequences > 0 ? positiveConsequences / totalConsequences : 0;
         
-        // Lógica de progressão no tabuleiro
-        let boardMovement = effects['board_position'] || 0; // Começa com o movimento base da carta
+        // Pega movimento base da carta (se houver)
+        let boardMovement = effects['board_position'] || 0; 
+
         if (difficulty === 'hard') {
-            const capitalChange = effects['capital'] || 0;
-            const supportChange = effects['popular_support'] || 0;
-
-            if (capitalChange > 0 && supportChange > 0) boardMovement += 2; 
-            else if (capitalChange > 0 || supportChange > 0) boardMovement += 1;
-            else if (capitalChange < 0 && supportChange < 0) boardMovement -= 1;
+            // MODO DIFÍCIL (Regras estritas de regressão)
+            if (ratio > 0.50) {
+                boardMovement += 1; // Saldo Positivo
+            } else if (ratio > 0.30) {
+                boardMovement += 0; // Neutro (Entre 30% e 50%)
+            } else {
+                boardMovement -= 1; // < 30% (Retrocesso facilitado)
+            }
         } else {
-             const ratio = totalConsequences > 0 ? positiveConsequences / totalConsequences : 0;
-             if (ratio > 0.5) boardMovement += 2;
-             else if (ratio >= 1/3) boardMovement += 1;
-             else if (ratio === 0 && totalConsequences > 1) boardMovement -= 1;
+            // MODO FÁCIL / MÉDIO (Regras de recompensa)
+            if (ratio > 0.66) {
+                boardMovement += 2; // Decisão Transformadora (> 66%)
+            } else if (ratio > 0.30) {
+                boardMovement += 1; // Saldo Positivo (> 30%)
+            } else if (ratio > 0.10) { 
+                boardMovement += 0; // Decisão de Manutenção (Tem algum positivo, mas é baixo)
+            } else {
+                boardMovement -= 1; // Retrocesso Social (Majoritariamente ou totalmente negativo)
+            }
         }
-        updates.board_position = Math.max(0, updates.board_position + boardMovement);
 
+        // Aplica o movimento garantindo que não fique negativo
+        updates.board_position = Math.max(0, updates.board_position + boardMovement);
+        
+        // ----------------------------------------
 
         const effectsString = Object.entries(effects).map(([key, value]) => `${key}: ${value > 0 ? '+' : ''}${value}`).join(', ');
 
@@ -408,21 +426,25 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             }
         }
         
-        // Verifica vitória coletiva se o jogo ainda estiver em andamento
-        if (gameStatus === 'in_progress' && updates.board_position >= 25) { // Supondo que 25 é o final
+        // Vitória Coletiva (Casa 25 + Indicadores > 7)
+        if (gameStatus === 'in_progress' && updates.board_position >= 25) { 
              const collectiveWin = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'].every(key => updates[key] > 7);
              if(collectiveWin) {
                 gameStatus = 'finished';
                 gameOverMessage = "Vitória Coletiva! A nação prosperou e alcançou a Justiça Social!";
+             } else {
+                 // Chegou no final mas o país está ruim? Pode ser considerado uma vitória parcial ou derrota moral, 
+                 // mas por enquanto manteremos o jogo rodando ou finalizamos sem vitória gloriosa.
+                 // Lógica opcional: Se chegou na casa 25 mas não tem stats, o jogo trava ou finaliza com "Governo Medíocre".
+                 // Vou manter in_progress para forçá-los a melhorar os stats ou finaliza aqui como 'finished' mas sem msg de vitória.
              }
         }
         
-        // Verifica vitória do Oportunista se o jogo ainda estiver em andamento
+        // Vitória do Oportunista
         if (gameStatus === 'in_progress') {
             const opportunist = await client.query(`SELECT id, capital, nickname FROM players WHERE session_id = $1 AND character_role = 'Oportunista'`, [state.id]);
             if(opportunist.rowCount > 0) {
                 const opportunistPlayer = opportunist.rows[0];
-                // Verifica se o jogador que tomou a decisão é o oportunista para usar o capital atualizado
                 const capitalToCheck = opportunistPlayer.id === state.player_id ? newPlayerCapital : opportunistPlayer.capital;
 
                 if(capitalToCheck >= 100 && updates.education < 3) {
@@ -432,7 +454,6 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             }
         }
         
-
         // 6. Atualizações no Banco
         await client.query(`
             UPDATE nation_states SET 
@@ -513,8 +534,6 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
                 
                 if (newCardRes.rowCount > 0) {
                     await client.query(`INSERT INTO session_decision_cards (session_id, card_id) VALUES ($1, $2)`, [state.id, newCardRes.rows[0].id]);
-                } else {
-                     console.error(`Nenhuma carta encontrada para o papel ${nextRole} ou genérica, mesmo após reset.`);
                 }
             }
         }
