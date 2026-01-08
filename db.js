@@ -51,7 +51,7 @@ async function createGame(userUid, playerName, isObserver = false) {
                 // Registra na tabela, mas sem capital, sem turno e role fixa
                 await client.query(`
                     INSERT INTO players (session_id, nickname, user_uid, capital, character_role, turn_order)
-                    VALUES ($1, $2, $3, 0, 'observador', NULL)
+                    VALUES ($1, $2, $3, 0, 'observador', -1)
                 `, [sessionId, playerName, userUid]);
             } else {
                 // --- CAMINHO DO JOGADOR CRIADOR ---
