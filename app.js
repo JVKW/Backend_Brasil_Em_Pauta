@@ -15,13 +15,13 @@ app.use(cors());
 // =======================================================
 app.post("/game/create", async (req, res) => {
     try {
-        const { userUid, playerName } = req.body;
+        const { userUid, playerName, isObserver } = req.body;
 
         if (!userUid || !playerName) {
             return res.status(400).json({ error: "UID e Nome são obrigatórios." });
         }
 
-        const result = await db.createGame(userUid, playerName);
+        const result = await db.createGame(userUid, playerName, isObserver);
         
         console.log(`Jogo criado: ${result.gameCode} por ${playerName}`);
         res.status(201).json(result);
