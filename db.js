@@ -1,7 +1,7 @@
 const { Pool } = require("pg");
 
 const pool = new Pool({
-    connectionString: process.env.CONNECTION_STRING,
+    connectionString: process.env.CONNECTION_STRING,    
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 2000,
@@ -195,13 +195,13 @@ async function startGame(gameCode) {
 async function getFullGameState(gameCode) {
     const client = await pool.connect();
     try {
-        // Busca a sessão e o estado da nação em uma única consulta
         const sessionRes = await client.query(`
             SELECT 
                 s.id, s.game_code, s.status, s.creator_user_uid, s.current_turn, 
                 s.current_player_index, s.end_reason, s.difficulty, s.game_over_message,
                 ns.economy, ns.education, ns.wellbeing, ns.popular_support, 
-                ns.hunger, ns.military_religion, ns.board_position
+                ns.hunger, ns.military_religion, ns.board_position,
+                ns.education_history -- <--- ADICIONADO AQUI
             FROM game_sessions s
             LEFT JOIN nation_states ns ON s.id = ns.game_session_id
             WHERE s.game_code = $1
@@ -215,7 +215,6 @@ async function getFullGameState(gameCode) {
             FROM players WHERE session_id = $1 ORDER BY turn_order ASC
         `, [sessionWithState.id]);
 
-        // Busca carta atual E AS OPÇÕES
         const cardRes = await client.query(`
             SELECT sdc.id as session_card_id, dc.title, dc.dilemma, dc.options
             FROM session_decision_cards sdc
@@ -224,7 +223,6 @@ async function getFullGameState(gameCode) {
             ORDER BY sdc.id DESC LIMIT 1
         `, [sessionWithState.id]);
 
-        //BUSCAR OS LOGS 
         const logsRes = await client.query(`
             SELECT id, turn, player_name as "playerName", player_role as "playerRole", decision_text as "decision", effects_text as "effects"
             FROM game_logs 
@@ -293,19 +291,19 @@ async function restartGame(gameCode, userUid) {
 }
 
 async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
-    // choiceIndex deve ser um inteiro: 0, 1, 2 ou 3
     const client = await pool.connect();
     
     try {
         await client.query('BEGIN');
 
-        // 1. Validar Sessão e Turno
+        // 1. Validar Sessão e Turno (Adicionado education_history no SELECT)
         const sessionAndNationRes = await client.query(`
             SELECT 
                 s.id, s.status, s.current_turn, s.current_player_index, s.game_over_message,
                 p.user_uid as current_player_uid, p.id as player_id, p.capital, p.nickname, p.character_role,
                 ns.economy, ns.education, ns.wellbeing, ns.popular_support, 
-                ns.hunger, ns.military_religion, ns.board_position
+                ns.hunger, ns.military_religion, ns.board_position,
+                ns.education_history
             FROM game_sessions s
             JOIN players p ON s.id = p.session_id AND p.turn_order = s.current_player_index
             JOIN nation_states ns ON s.id = ns.game_session_id
@@ -336,9 +334,9 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         }
 
         const selectedOption = currentCard.options[idx];
-        const effects = selectedOption.effect; // JSON com os efeitos
+        const effects = selectedOption.effect;
 
-        // 4. Aplicar Efeitos e Calcular Progressão
+        // 4. Aplicar Efeitos
         let updates = {
             economy: state.economy, education: state.education, wellbeing: state.wellbeing,
             popular_support: state.popular_support, hunger: state.hunger, military_religion: state.military_religion,
@@ -346,7 +344,6 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         };
         let newPlayerCapital = state.capital;
 
-        // Loop de aplicação com Clamping (0 a 10)
         for (const [key, val] of Object.entries(effects)) {
             if (key === 'capital') {
                 newPlayerCapital = Math.max(0, newPlayerCapital + val);
@@ -356,63 +353,46 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
                 updates[key] = Math.min(10, Math.max(0, updates[key] + val));
             }
         }
+
+        // --- ATUALIZAR HISTÓRICO DE EDUCAÇÃO ---
+        let history = state.education_history || [state.education];
+        history.push(updates.education);
+        const historyJson = JSON.stringify(history);
         
         // --- LÓGICA DE PROGRESSÃO NO TABULEIRO ---
-        
-        // 1. Calcular proporção de consequências positivas
         const consequences = Object.entries(effects).filter(([key]) => key !== 'capital' && key !== 'board_position');
         const totalConsequences = consequences.length;
         let positiveConsequences = 0;
 
         consequences.forEach(([key, value]) => {
-            if (key === 'hunger' && value < 0) {
-                positiveConsequences++; // Fome diminuir é bom
-            } else if (key !== 'hunger' && value > 0) {
-                positiveConsequences++; // Outros aumentarem é bom
-            }
+            if (key === 'hunger' && value < 0) positiveConsequences++;
+            else if (key !== 'hunger' && value > 0) positiveConsequences++;
         });
 
-        // Evita divisão por zero
         const ratio = totalConsequences > 0 ? positiveConsequences / totalConsequences : 0;
-        
-        // Pega movimento base da carta (se houver)
         let boardMovement = effects['board_position'] || 0; 
 
         if (difficulty === 'hard') {
-            // MODO DIFÍCIL (Regras estritas de regressão)
-            if (ratio > 0.50) {
-                boardMovement += 1; // Saldo Positivo
-            } else if (ratio > 0.30) {
-                boardMovement += 0; // Neutro (Entre 30% e 50%)
-            } else {
-                boardMovement -= 1; // < 30% (Retrocesso facilitado)
-            }
+            if (ratio > 0.50) boardMovement += 1;
+            else if (ratio > 0.30) boardMovement += 0;
+            else boardMovement -= 1;
         } else {
-            // MODO FÁCIL / MÉDIO (Regras de recompensa)
-            if (ratio > 0.66) {
-                boardMovement += 2; // Decisão Transformadora (> 66%)
-            } else if (ratio > 0.30) {
-                boardMovement += 1; // Saldo Positivo (> 30%)
-            } else if (ratio > 0.10) { 
-                boardMovement += 0; // Decisão de Manutenção (Tem algum positivo, mas é baixo)
-            } else {
-                boardMovement -= 1; // Retrocesso Social (Majoritariamente ou totalmente negativo)
-            }
+            if (ratio > 0.66) boardMovement += 2;
+            else if (ratio > 0.30) boardMovement += 1;
+            else if (ratio > 0.10) boardMovement += 0;
+            else boardMovement -= 1;
         }
 
-        // Aplica o movimento garantindo que não fique negativo
         updates.board_position = Math.max(0, updates.board_position + boardMovement);
         
-        // ----------------------------------------
-
+        // --- REGISTRO DE LOGS ---
         const effectsString = Object.entries(effects).map(([key, value]) => `${key}: ${value > 0 ? '+' : ''}${value}`).join(', ');
-
         await client.query(`
             INSERT INTO game_logs (session_id, turn, player_name, player_role, decision_text, effects_text)
             VALUES ($1, $2, $3, $4, $5, $6)
         `, [state.id, state.current_turn, state.nickname, state.character_role, selectedOption.text, effectsString]);
 
-        // 5. Verificar Vitória/Derrota
+        // --- 5. VERIFICAR VITÓRIA/DERROTA (COM NOVAS MENSAGENS) ---
         let gameStatus = 'in_progress';
         let gameOverMessage = null;
 
@@ -420,27 +400,26 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             const nonHungerIndicators = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'];
             const anyIndicatorAtOrBelowZero = nonHungerIndicators.some(key => updates[key] <= 0);
 
+            // DERROTA: Fome >= 10 ou algum indicador zerou
             if (updates.hunger >= 10 || anyIndicatorAtOrBelowZero) {
                 gameStatus = 'finished';
-                gameOverMessage = "Colapso! Um indicador essencial chegou a zero ou a fome atingiu níveis insustentáveis. A nação entrou em ruínas. Todos perdem.";
+                gameOverMessage = "A gestão negligente dos direitos fundamentais levou ao colapso. Quando a política ignora a ética, a sociedade paga com a própria vida.";
             }
         }
         
-        // Vitória Coletiva (Casa 25 + Indicadores > 7)
+        // VITÓRIA: Chegou ao fim (>=25) com Fome controlada (< 10)
         if (gameStatus === 'in_progress' && updates.board_position >= 25) { 
-             const collectiveWin = ['economy', 'education', 'wellbeing', 'popular_support', 'military_religion'].every(key => updates[key] > 7);
-             if(collectiveWin) {
+             if(updates.hunger < 10) {
                 gameStatus = 'finished';
-                gameOverMessage = "Vitória Coletiva! A nação prosperou e alcançou a Justiça Social!";
+                gameOverMessage = "Através da práxis e do diálogo, vocês construíram uma sociedade onde a liberdade é real e a dignidade é garantida. A ética venceu a barbárie.";
              } else {
-                 // Chegou no final mas o país está ruim? Pode ser considerado uma vitória parcial ou derrota moral, 
-                 // mas por enquanto manteremos o jogo rodando ou finalizamos sem vitória gloriosa.
-                 // Lógica opcional: Se chegou na casa 25 mas não tem stats, o jogo trava ou finaliza com "Governo Medíocre".
-                 // Vou manter in_progress para forçá-los a melhorar os stats ou finaliza aqui como 'finished' mas sem msg de vitória.
+                 // Chegou ao fim, mas com muita fome (Fome = 10 já teria disparado derrota acima, então isso cobre o limite 9/10)
+                 gameStatus = 'finished';
+                 gameOverMessage = "O mandato acabou, mas as marcas da desigualdade permanecem profundas na sociedade.";
              }
         }
         
-        // Vitória do Oportunista
+        // Vitória do Oportunista (Prioridade sobre os outros)
         if (gameStatus === 'in_progress') {
             const opportunist = await client.query(`SELECT id, capital, nickname FROM players WHERE session_id = $1 AND character_role = 'Oportunista'`, [state.id]);
             if(opportunist.rowCount > 0) {
@@ -458,17 +437,19 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
         await client.query(`
             UPDATE nation_states SET 
                 economy=$1, education=$2, wellbeing=$3, popular_support=$4, 
-                hunger=$5, military_religion=$6, board_position=$7
-            WHERE game_session_id=$8
+                hunger=$5, military_religion=$6, board_position=$7,
+                education_history=$8::jsonb
+            WHERE game_session_id=$9
         `, [
             updates.economy, updates.education, updates.wellbeing, updates.popular_support, 
-            updates.hunger, updates.military_religion, updates.board_position, state.id
+            updates.hunger, updates.military_religion, updates.board_position, 
+            historyJson, // Salva histórico
+            state.id
         ]);
         
         await client.query(`
             UPDATE game_sessions SET status=$1, game_over_message=$2 WHERE id=$3
         `,[gameStatus, gameOverMessage, state.id]);
-
 
         await client.query(`UPDATE players SET capital = $1 WHERE id = $2`, [newPlayerCapital, state.player_id]);
 
@@ -476,59 +457,36 @@ async function processDecision(gameCode, userUid, choiceIndex, difficulty) {
             UPDATE session_decision_cards SET is_resolved = TRUE, choice_made = $1 WHERE id = $2
         `, [idx, currentCard.session_card_id]);
 
-        // 7. Próximo Turno
+        // 7. Próximo Turno (Mantém a lógica de sorteio de cartas igual)
         if (gameStatus === 'in_progress') {
-            
-            const countRes = await client.query(`
-                SELECT COUNT(*) as c FROM players 
-                WHERE session_id = $1 AND character_role != 'Observador'
-            `, [state.id]);
-            
+            const countRes = await client.query(`SELECT COUNT(*) as c FROM players WHERE session_id = $1 AND character_role != 'Observador'`, [state.id]);
             const totalPlayers = parseInt(countRes.rows[0].c);
             
             if (totalPlayers > 0) {
                 let nextIndex = (state.current_player_index + 1) % totalPlayers;
-                
-                if (nextIndex === 0) {
-                    await client.query(`UPDATE game_sessions SET current_turn = current_turn + 1 WHERE id = $1`, [state.id]);
-                }
+                if (nextIndex === 0) await client.query(`UPDATE game_sessions SET current_turn = current_turn + 1 WHERE id = $1`, [state.id]);
                 await client.query(`UPDATE game_sessions SET current_player_index = $1 WHERE id = $2`, [nextIndex, state.id]);
 
-                const nextPlayerRes = await client.query(`
-                    SELECT character_role FROM players 
-                    WHERE session_id = $1 AND turn_order = $2
-                `, [state.id, nextIndex]);
-                
-                if (nextPlayerRes.rowCount === 0) throw new Error("Erro crítico: Próximo jogador não encontrado.");
-
+                const nextPlayerRes = await client.query(`SELECT character_role FROM players WHERE session_id = $1 AND turn_order = $2`, [state.id, nextIndex]);
                 const nextRole = nextPlayerRes.rows[0].character_role;
 
                 let newCardRes = await client.query(`
                     SELECT id FROM decision_cards 
                     WHERE (assigned_role = $1 OR assigned_role IS NULL)
-                    AND id NOT IN (
-                        SELECT card_id FROM session_decision_cards WHERE session_id = $2
-                    )
+                    AND id NOT IN (SELECT card_id FROM session_decision_cards WHERE session_id = $2)
                     ORDER BY RANDOM() LIMIT 1
                 `, [nextRole, state.id]);
 
                 if (newCardRes.rowCount === 0) {
-                     // Deck do papel específico esgotou, busca carta genérica
                      newCardRes = await client.query(`
                         SELECT id FROM decision_cards 
                         WHERE assigned_role IS NULL
-                        AND id NOT IN (
-                            SELECT card_id FROM session_decision_cards WHERE session_id = $1
-                        )
+                        AND id NOT IN (SELECT card_id FROM session_decision_cards WHERE session_id = $1)
                         ORDER BY RANDOM() LIMIT 1
                     `, [state.id]);
                     if(newCardRes.rowCount === 0) {
-                        // Se até as genéricas acabaram, reseta o deck do papel
                         await client.query(`DELETE FROM session_decision_cards WHERE session_id = $1 AND card_id IN (SELECT id FROM decision_cards WHERE assigned_role = $2)`, [state.id, nextRole]);
-                         newCardRes = await client.query(`
-                            SELECT id FROM decision_cards 
-                            WHERE assigned_role = $1 ORDER BY RANDOM() LIMIT 1`, [nextRole]
-                         );
+                         newCardRes = await client.query(`SELECT id FROM decision_cards WHERE assigned_role = $1 ORDER BY RANDOM() LIMIT 1`, [nextRole]);
                     }
                 }
                 
@@ -559,20 +517,22 @@ async function resetNationState(client, sessionId, difficulty) {
     // Modo Difícil começa com 3, Normal/Fácil com 5
     const initialValue = difficulty === 'hard' ? 3 : 5;
 
-    // Tenta atualizar se já existir
+    // INICIALIZA O HISTÓRICO COM O VALOR INICIAL
+    const initialHistory = JSON.stringify([initialValue]);
+
     const updateRes = await client.query(`
         UPDATE nation_states
         SET economy=$1, education=$1, wellbeing=$1, popular_support=$1, 
-            hunger=0, military_religion=$1, board_position=0
+            hunger=0, military_religion=$1, board_position=0,
+            education_history=$3::jsonb 
         WHERE game_session_id = $2
-    `, [initialValue, sessionId]);
+    `, [initialValue, sessionId, initialHistory]);
 
-    // Se não atualizou nenhuma linha (é uma nova partida), insere.
     if (updateRes.rowCount === 0) {
         await client.query(`
-            INSERT INTO nation_states (game_session_id, economy, education, wellbeing, popular_support, hunger, military_religion, board_position)
-            VALUES ($1, $2, $2, $2, $2, 0, $2, 0)
-        `, [sessionId, initialValue]);
+            INSERT INTO nation_states (game_session_id, economy, education, wellbeing, popular_support, hunger, military_religion, board_position, education_history)
+            VALUES ($1, $2, $2, $2, $2, 0, $2, 0, $3::jsonb)
+        `, [sessionId, initialValue, initialHistory]);
     }
 }
 
